@@ -1,0 +1,117 @@
+version: 0.2
+env:
+  variables:
+    TERRAFORM_DOWNLOAD_URL: https://releases.hashicorp.com/terraform/0.12.19/terraform_0.12.19_linux_amd64.zip
+phases:
+  install:
+    #runtime-versions:
+    #  nodejs: 13
+    commands:
+      #- pwd
+      #- ls -lthr
+      # creating a symbolic link to common terraform modules so that it can be refered by terraform scripts
+      - ln -s $CODEBUILD_SRC_DIR_commonModulesTerraform $CODEBUILD_SRC_DIR/../common_modules_terraform
+      - ls -l 
+      - apt-get update
+      - apt-cache search source
+      - apt-get install -y curl jq unzip
+      - wget $TERRAFORM_DOWNLOAD_URL
+      - unzip -o terraform_0.12.19_linux_amd64.zip
+      - mv terraform /bin
+      - rm terraform_0.12.19_linux_amd64.zip
+  pre_build:
+    commands:
+      - cd terraformScripts
+      
+      # get tfstate files from s3 and place them in terraformScripts folder so terraform knows what was done on the previous run
+      - aws s3 sync $S3_FOR_TERRAFORM_STATE . --exclude "*" --include "*.tfstate*"
+      - terraform init
+      # selecting or creating workspace 
+      #- terraform workspace select $TERRAFORM_WORKSPACE || terraform workspace new $TERRAFORM_WORKSPACE
+      #- terraform destroy -auto-approve -var-file="$TERRAFORM_WORKSPACE.tfvars"
+      #- terraform workspace delete $TERRAFORM_WORKSPACE
+      - terraform workspace select $TERRAFORM_WORKSPACE || terraform workspace new $TERRAFORM_WORKSPACE
+      #- terraform apply -auto-approve -var-file="$TERRAFORM_WORKSPACE.tfvars"
+      - terraform plan -out="plan.tfplan" -var-file="$TERRAFORM_WORKSPACE.tfvars"
+      - terraform apply "plan.tfplan"
+      - DISTRIBUTION_ID=`terraform output distribution_id`
+    finally:
+      # take tfstate files and write them back to s3 for next time this runs
+      - aws s3 sync . $S3_FOR_TERRAFORM_STATE --exclude "*" --include "*.tfstate*"
+
+  build:
+    commands:
+      # assume the deployment role in current account so we can use aws cli
+      - aws sts assume-role --role-arn "$TERRAFORM_DEPLOYMENT_ROLE" --role-session-name "bcomwebsite" > creds.json
+      - export AWS_ACCESS_KEY_ID=$(cat creds.json | jq -r '.Credentials.AccessKeyId')
+      - export AWS_SECRET_ACCESS_KEY=$(cat creds.json | jq -r '.Credentials.SecretAccessKey')
+      - export AWS_SESSION_TOKEN=$(cat creds.json | jq -r '.Credentials.SessionToken')
+      - echo "AWS_ACCESS_KEY_ID"
+      - echo "AWS_SECRET_ACCESS_KEY"
+      #- aws s3 rm $S3_PRIMARY_BUCKET --recursive
+      #- aws s3 rm $S3_FAILOVER_BUCKET --recursive
+      #- aws s3 sync $CODEBUILD_SRC_DIR_buildOutput "$S3_PRIMARY_BUCKET"
+      #- echo '{"hostRegion":"US-EAST-1"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_PRIMARY_BUCKET"
+      #- sleep 20s
+      #- echo '{"hostRegion":"US-WEST-2"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_FAILOVER_BUCKET"
+      #- echo $DISTRIBUTION_ID
+      #- aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/index.html"
+
+      #S3 rm could have been in the common step but we might need to take backup of prod bucket
+      #deploying to development Env
+      - |
+        if expr ${env_build} == "dev"; then
+          aws s3 rm $S3_PRIMARY_BUCKET --recursive
+          aws s3 rm $S3_FAILOVER_BUCKET --recursive
+          aws s3 sync $CODEBUILD_SRC_DIR_buildOutput "$S3_PRIMARY_BUCKET"
+          echo '{"hostRegion":"US-EAST-1"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_PRIMARY_BUCKET"
+          sleep 20s
+          echo '{"hostRegion":"US-WEST-2"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_FAILOVER_BUCKET"
+          echo $DISTRIBUTION_ID
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/index.html"
+        fi
+      
+      - |
+        if expr ${env_build} == "test"; then
+          aws s3 rm $S3_PRIMARY_BUCKET --recursive
+          aws s3 rm $S3_FAILOVER_BUCKET --recursive
+          aws s3 sync $CODEBUILD_SRC_DIR_tstbuildOutput "$S3_PRIMARY_BUCKET"
+          echo '{"hostRegion":"US-EAST-1"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_PRIMARY_BUCKET"
+          sleep 20s
+          echo '{"hostRegion":"US-WEST-2"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_FAILOVER_BUCKET"
+          echo $DISTRIBUTION_ID
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/index.html"
+          # Exectuing QA Automation Test 
+          cd $CODEBUILD_SRC_DIR_sourceQaAutomation
+          pwd
+          echo "Executing QA Automation test on TEST Env"
+          #mvn clean test -DargLine=-Denv=sandboxEnv -Dsurefire.suiteXmlFiles=testNGExecution/test.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/sandbox.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/mac.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/iOS.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/android.xml
+        fi
+      - |
+        if expr ${env_build} == "prod"; then
+          aws s3 rm $S3_PRIMARY_BUCKET --recursive
+          aws s3 rm $S3_FAILOVER_BUCKET --recursive
+          aws s3 sync $CODEBUILD_SRC_DIR_prdbuildOutput "$S3_PRIMARY_BUCKET"
+          echo '{"hostRegion":"US-EAST-1"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_PRIMARY_BUCKET"
+          sleep 20s
+          echo '{"hostRegion":"US-WEST-2"}' > regionIdentifier.json | aws s3 cp regionIdentifier.json "$S3_FAILOVER_BUCKET"
+          echo $DISTRIBUTION_ID
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/index.html"
+          #Executing QA Automation Test
+          cd $CODEBUILD_SRC_DIR_sourceQaAutomation
+          pwd
+          echo "Executing Smoke Test on Prod Env"
+          #- mvn clean test -DargLine=-Denv=sandboxEnv -Dsurefire.suiteXmlFiles=testNGExecution/sandbox.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/sandbox.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/mac.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/iOS.xml
+          #- mvn clean test -DargLine=-Denv=devEnv -Dsurefire.suiteXmlFiles=testNGExecution/android.xml
+        fi
+    
+  post_build:
+    commands: 
+      - echo "Build is Completed on $env Environment"
