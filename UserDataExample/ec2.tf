@@ -4,7 +4,7 @@ provider "aws" {
 }
 
 data "template_file" "user_data" {
-template = "${file("userdata.sh")}"
+template = "${file("${path.module}/userdata.sh")}"
 }
 
 resource "aws_instance" "web" {
